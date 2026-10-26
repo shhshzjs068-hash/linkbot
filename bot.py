@@ -40,7 +40,9 @@ SESSION = os.getenv("SESSION_PATH", os.path.join(DATA_DIR, "checker_session"))
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(link_preview_is_disabled=True))
 dp = Dispatcher()
-client = TelegramClient(StringSession(SESSION_STRING) if SESSION_STRING else SESSION, API_ID, API_HASH)
+# receive_updates=False: we only make requests, so don't stream every update of every channel the account is in
+client = TelegramClient(StringSession(SESSION_STRING) if SESSION_STRING else SESSION, API_ID, API_HASH,
+                        receive_updates=False)
 check_lock = asyncio.Lock()  # one live Telegram check at a time (flood protection)
 running: dict[int, asyncio.Event] = {}  # user_id -> cancel flag
 last_unknown: dict[int, list[str]] = {}  # user_id -> links that couldn't be checked (for /retry)
@@ -282,6 +284,8 @@ async def get_result(l: dict, cfg: dict, ctl: dict | None = None) -> dict:
         await asyncio.sleep(delay_now)
     if res["status"] != "unknown":
         cache_put(l["id"], res)
+    else:
+        logging.warning("UNCHECKED %s -> %s", l["link"], res["reason"])
     res["cached"] = False
     return res
 
