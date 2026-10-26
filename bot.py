@@ -30,7 +30,8 @@ API_HASH = os.environ["API_HASH"]
 PHONE = os.getenv("PHONE")  # only for first login when running locally without SESSION_STRING
 SESSION_STRING = os.getenv("SESSION_STRING")  # generate with gen_session.py (required on Railway)
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-DELAY = float(os.getenv("CHECK_DELAY", "0.8"))  # seconds between live checks
+DELAY = float(os.getenv("CHECK_DELAY", "0.8"))  # base seconds between live checks
+MAX_FLOOD = int(os.getenv("MAX_FLOOD_WAIT", "1200"))  # longest Telegram rate-limit wait we will sit out (s)
 CACHE_TTL = float(os.getenv("CACHE_TTL_HOURS", "6")) * 3600
 # On Railway, attach a Volume: RAILWAY_VOLUME_MOUNT_PATH is set automatically and the DB goes there.
 DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ".")
@@ -42,6 +43,8 @@ dp = Dispatcher()
 client = TelegramClient(StringSession(SESSION_STRING) if SESSION_STRING else SESSION, API_ID, API_HASH)
 check_lock = asyncio.Lock()  # one live Telegram check at a time (flood protection)
 running: dict[int, asyncio.Event] = {}  # user_id -> cancel flag
+last_unknown: dict[int, list[str]] = {}  # user_id -> links that couldn't be checked (for /retry)
+delay_now = DELAY  # adaptive: grows after rate limits, shrinks back when things go well
 
 # ----------------------------------------------------------------- database
 db = sqlite3.connect(DB_PATH)
@@ -220,12 +223,26 @@ def invite_result(res: dict, r) -> dict:
     return fin(res, "working")
 
 
-async def check_link(l: dict, want_activity: bool) -> dict:
+async def flood_sleep(seconds: int, ctl: dict | None) -> bool:
+    """Sit out a Telegram rate limit (cancellable). Slows future checks down. False if cancelled."""
+    global delay_now
+    delay_now = min(delay_now * 1.5 + 0.5, 6.0)
+    if ctl and ctl.get("notify"):
+        await ctl["notify"](seconds)
+    end = time.time() + seconds
+    while time.time() < end:
+        if ctl and ctl["cancel"].is_set():
+            return False
+        await asyncio.sleep(max(0.0, min(5.0, end - time.time())))
+    return True
+
+
+async def check_link(l: dict, want_activity: bool, ctl: dict | None = None) -> dict:
     res = {"id": l["id"], "kind": l["kind"], "key": l["key"], "link": l["link"],
            "status": "unknown", "reason": "", "title": "", "members": None, "type": "",
            "join_request": False, "verified": False, "last_post": None,
            "has_activity": want_activity}
-    for _ in range(3):
+    for _ in range(6):
         try:
             if l["kind"] == "invite":
                 r = await client(CheckChatInviteRequest(l["key"]))
@@ -241,24 +258,28 @@ async def check_link(l: dict, want_activity: bool) -> dict:
         except (errors.ChannelPrivateError, errors.ChannelBannedError):
             return fin(res, "violated", "banned/unavailable")
         except errors.FloodWaitError as e:
-            if e.seconds > 90:
-                return fin(res, "unknown", f"flood wait {e.seconds}s")
-            await asyncio.sleep(e.seconds + 1)
+            if e.seconds > MAX_FLOOD:
+                return fin(res, "unknown", f"rate limit {e.seconds}s (too long, try /retry later)")
+            if not await flood_sleep(e.seconds + 1, ctl):
+                return fin(res, "unknown", "cancelled")
         except Exception as e:  # noqa: BLE001
             logging.exception("check failed for %s", l["link"])
             return fin(res, "unknown", type(e).__name__)
     return fin(res, "unknown", "retry limit")
 
 
-async def get_result(l: dict, cfg: dict) -> dict:
+async def get_result(l: dict, cfg: dict, ctl: dict | None = None) -> dict:
+    global delay_now
     need_activity = cfg["max_inactive"] > 0 and l["kind"] == "public"
     cached = cache_get(l["id"])
     if cached and (not need_activity or cached.get("has_activity") or cached["status"] != "working"):
         cached["cached"] = True
         return cached
     async with check_lock:
-        res = await check_link(l, need_activity)
-        await asyncio.sleep(DELAY)
+        res = await check_link(l, need_activity, ctl)
+        if res["status"] != "unknown":
+            delay_now = max(DELAY, delay_now * 0.95)
+        await asyncio.sleep(delay_now)
     if res["status"] != "unknown":
         cache_put(l["id"], res)
     res["cached"] = False
@@ -360,11 +381,19 @@ async def process(msg: Message, text: str):
     running[uid] = cancel
     status = await msg.answer(f"Checking 0/{len(links)}...", reply_markup=cancel_kb())
     results, last_edit = [], 0.0
+    state = {"i": 0}
+
+    async def notify(secs: int):
+        await safe_edit(status, f"Telegram rate limit hit. Waiting {secs}s, then continuing "
+                                f"({state['i']}/{len(links)} done)...", cancel_kb())
+
+    ctl = {"cancel": cancel, "notify": notify}
     try:
         for i, l in enumerate(links, 1):
             if cancel.is_set():
                 break
-            results.append(await get_result(l, cfg))
+            state["i"] = i - 1
+            results.append(await get_result(l, cfg, ctl))
             if time.time() - last_edit > 2.5:
                 last_edit = time.time()
                 await safe_edit(status, f"Checking {i}/{len(links)}...", cancel_kb())
@@ -377,6 +406,15 @@ async def process(msg: Message, text: str):
         res["bucket"], res["why"] = b, why
         buckets[b].append(res)
     buckets["working"].sort(key=lambda r: r["members"] or 0, reverse=True)
+    last_unknown[uid] = [r["link"] for r in buckets["unknown"]] + [l["link"] for l in links[len(results):]]
+    why_unknown = {}
+    for r in buckets["unknown"]:
+        k = re.sub(r"\d+", "N", r["reason"] or "unknown")
+        why_unknown[k] = why_unknown.get(k, 0) + 1
+    unk_note = ""
+    if why_unknown:
+        unk_note = ("\nUnchecked because: " + ", ".join(f"{k} x{v}" for k, v in why_unknown.items())
+                    + "\nSend /retry to re-check them.")
 
     cached_n = sum(1 for r in results if r.get("cached"))
     head = "Cancelled early." if cancel.is_set() else "Done."
@@ -387,7 +425,7 @@ async def process(msg: Message, text: str):
         f"Violated/restricted (kept aside): {len(buckets['violated'])}\n"
         f"Filtered by your settings (kept aside): {len(buckets['filtered'])}\n"
         f"Dead/expired: {len(buckets['dead'])}\n"
-        f"Couldn't check: {len(buckets['unknown'])}",
+        f"Couldn't check: {len(buckets['unknown'])}" + unk_note,
     )
 
     if buckets["working"]:
@@ -491,8 +529,19 @@ async def cmd_start(msg: Message):
         "aside in separate files, plus a full CSV report.\n\n"
         "/settings - filters (type, min members, activity, join-request)\n"
         "/stats - your totals\n"
+        "/retry - re-check links that couldn't be checked (rate limits)\n"
         "/cancel - stop the running job\n"
         "/clearcache - forget cached results")
+
+
+@dp.message(Command("retry"))
+async def cmd_retry(msg: Message):
+    if not allowed_id(msg.from_user.id):
+        return
+    links = last_unknown.get(msg.from_user.id)
+    if not links:
+        return await msg.answer("Nothing to retry.")
+    await process(msg, "\n".join(links))
 
 
 @dp.message(Command("cancel"))
@@ -562,6 +611,7 @@ async def main():
     await bot.set_my_commands([
         BotCommand(command="settings", description="Filters: type, members, activity"),
         BotCommand(command="stats", description="Your totals"),
+        BotCommand(command="retry", description="Re-check unchecked links"),
         BotCommand(command="cancel", description="Stop the running job"),
         BotCommand(command="clearcache", description="Forget cached results"),
         BotCommand(command="help", description="How to use"),

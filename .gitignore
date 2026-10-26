@@ -4,3 +4,4 @@
 *.db
 __pycache__/
 .venv/
+qr.png
